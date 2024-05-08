@@ -1,6 +1,6 @@
 #!/bin/bash
 
-# Copyright Istio Authors
+# Copyright 2018 Istio Authors
 #
 # Licensed under the Apache License, Version 2.0 (the "License");
 # you may not use this file except in compliance with the License.
@@ -14,91 +14,135 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+# Init script downloads or updates envoy and the go dependencies. Called from Makefile, which sets
+# the needed environment variables.
+
 set -o errexit
 set -o nounset
 set -o pipefail
 
-export ISTIO_REMOTE=${ISTIO_REMOTE:-origin}
-export ISTIO_BRANCH=${ISTIO_BRANCH:-master}
-
-# Determine the SHA for the Istio dependency by parsing the go.mod file.
-export ISTIO_SHA=${ISTIO_SHA:-$(< go.mod grep 'istio.io/istio v' | cut -d'-' -f3)}
-
-echo "ISTIOIO_GO=${ISTIOIO_GO}"
-echo "ISTIO_GO=${ISTIO_GO}"
-echo "ISTIO_REMOTE=${ISTIO_REMOTE}"
-echo "ISTIO_BRANCH=${ISTIO_BRANCH}"
-echo "ISTIO_SHA=${ISTIO_SHA}"
-
-# Download the Istio source if not available.
-if [[ -d "${ISTIO_GO}" ]]
-then
-  echo "${ISTIO_GO} already exists. Using existing repository ..."
-else
-  echo "${ISTIO_GO} not found. Cloning Istio repository ..."
-  git clone https://github.com/istio/istio.git "${ISTIO_GO}"
+if [[ "${TARGET_OUT_LINUX:-}" == "" ]]; then
+  echo "Environment variables not set. Make sure you run through the makefile (\`make init\`) rather than directly."
+  exit 1
 fi
 
-pushd "${ISTIO_GO}" > /dev/null
-
-# Get updates to the remote repository
-git fetch "$ISTIO_REMOTE"
-
-# Checkout the Istio version from the git dependency.
-git checkout "$ISTIO_SHA"
-
-# Build and install istioctl
-ISTIOCTL_ARTIFACT="${ISTIO_OUT}/release/"
-case "$GOOS_LOCAL" in
-  linux)
-    ISTIOCTL_ARTIFACT+="istioctl-${GOOS_LOCAL}-${GOARCH_LOCAL}"
-    ;;
-  darwin)
-    ISTIOCTL_ARTIFACT+="istioctl-osx"
-    ;;
-  windows)
-    ISTIOCTL_ARTIFACT+="istioctl-win.exe"
-    ;;
-  *)
-    echo "Unsupported platform: $GOOS_LOCAL"
-    exit 0
-    ;;
-esac
-# Location where istioctl will be run from.
-export ISTIOIO_BIN=${ISTIOIO_BIN:-"/gobin"}
-LONG_SHA=$(git rev-parse "${ISTIO_SHA}")
-export TAG=${TAG:-${ISTIO_IMAGE_VERSION}.${LONG_SHA}}
-export VERSION=${TAG}
-export ISTIO_VERSION=${TAG}
-echo "TAG=${TAG}"
-echo "VERSION=${VERSION}"
-echo "ISTIO_VERSION=${ISTIO_VERSION}"
-if [ -z "$IN_BUILD_CONTAINER" ]
-then
-  make "$ISTIOCTL_ARTIFACT"
-  cp -a "$ISTIOCTL_ARTIFACT" "${ISTIOIO_BIN}/istioctl"
+# Setup arch suffix for envoy binary. For backwards compatibility, amd64 has no suffix.
+if [[ "${TARGET_ARCH}" == "amd64" ]]; then
+	ISTIO_ENVOY_ARCH_SUFFIX=""
 else
-  make "${ISTIO_OUT}/release/istioctl-linux-${GOARCH_LOCAL}"
-  cp -a "${ISTIO_OUT}/release/istioctl-linux-${GOARCH_LOCAL}" /gobin/istioctl
+	ISTIO_ENVOY_ARCH_SUFFIX="-${TARGET_ARCH}"
 fi
 
-popd > /dev/null
+# Populate the git version for istio/proxy (i.e. Envoy)
+PROXY_REPO_SHA="${PROXY_REPO_SHA:-$(grep PROXY_REPO_SHA istio.deps  -A 4 | grep lastStableSHA | cut -f 4 -d '"')}"
 
-# Copy install, samples, and tool files over from Istio. These are needed by the tests.
-rm -rf "${ISTIOIO_GO}/samples" "${ISTIOIO_GO}/tools" "${ISTIOIO_GO}/tests/integration" "${ISTIOIO_GO}/manifests"
-cp -a "${ISTIO_GO}/samples" "${ISTIOIO_GO}/samples"
-mkdir "${ISTIOIO_GO}/tools"
-cp -a "${ISTIO_GO}/tools/certs" "${ISTIOIO_GO}/tools/certs"
-mkdir "${ISTIOIO_GO}/tests/integration/"
-cp -a "${ISTIO_GO}/tests/integration/iop-integration-test-defaults.yaml" "${ISTIOIO_GO}/tests/integration/"
-cp -a "${ISTIO_GO}/tests/integration/base.yaml" "${ISTIOIO_GO}/tests/integration/"
-sed -i "s/ENABLE_EXTERNAL_NAME_ALIAS: true$/ENABLE_EXTERNAL_NAME_ALIAS: false/" "${ISTIOIO_GO}/tests/integration/base.yaml"
-cp -a "${ISTIO_GO}/manifests" "${ISTIOIO_GO}/manifests"
+# Envoy binary variables
+ISTIO_ENVOY_BASE_URL="${ISTIO_ENVOY_BASE_URL:-https://storage.googleapis.com/istio-build/proxy}"
 
-# For generating junit.xml files
-function install-junit-report() {
-  (cd /tmp; go get github.com/jstemmer/go-junit-report)
+# If we are not using the default, assume its private and we need to authenticate
+if [[ "${ISTIO_ENVOY_BASE_URL}" != "https://storage.googleapis.com/istio-build/proxy" ]]; then
+  AUTH_HEADER="Authorization: Bearer $(gcloud auth print-access-token)"
+  export AUTH_HEADER
+fi
+
+SIDECAR="${SIDECAR:-envoy}"
+
+# OS-neutral vars. These currently only work for linux.
+ISTIO_ENVOY_VERSION="${ISTIO_ENVOY_VERSION:-${PROXY_REPO_SHA}}"
+ISTIO_ENVOY_DEBUG_URL="${ISTIO_ENVOY_DEBUG_URL:-${ISTIO_ENVOY_BASE_URL}/envoy-debug-${ISTIO_ENVOY_VERSION}${ISTIO_ENVOY_ARCH_SUFFIX}.tar.gz}"
+ISTIO_ENVOY_RELEASE_URL="${ISTIO_ENVOY_RELEASE_URL:-${ISTIO_ENVOY_BASE_URL}/envoy-alpha-${ISTIO_ENVOY_VERSION}${ISTIO_ENVOY_ARCH_SUFFIX}.tar.gz}"
+
+# Envoy Linux vars.
+ISTIO_ENVOY_LINUX_VERSION="${ISTIO_ENVOY_LINUX_VERSION:-${ISTIO_ENVOY_VERSION}}"
+ISTIO_ENVOY_LINUX_DEBUG_URL="${ISTIO_ENVOY_LINUX_DEBUG_URL:-${ISTIO_ENVOY_DEBUG_URL}}"
+ISTIO_ENVOY_LINUX_RELEASE_URL="${ISTIO_ENVOY_LINUX_RELEASE_URL:-${ISTIO_ENVOY_RELEASE_URL}}"
+# Variables for the extracted debug/release Envoy artifacts.
+ISTIO_ENVOY_LINUX_DEBUG_DIR="${ISTIO_ENVOY_LINUX_DEBUG_DIR:-${TARGET_OUT_LINUX}/debug}"
+ISTIO_ENVOY_LINUX_DEBUG_NAME="${ISTIO_ENVOY_LINUX_DEBUG_NAME:-envoy-debug-${ISTIO_ENVOY_LINUX_VERSION}}"
+ISTIO_ENVOY_LINUX_DEBUG_PATH="${ISTIO_ENVOY_LINUX_DEBUG_PATH:-${ISTIO_ENVOY_LINUX_DEBUG_DIR}/${ISTIO_ENVOY_LINUX_DEBUG_NAME}}"
+
+ISTIO_ENVOY_LINUX_RELEASE_DIR="${ISTIO_ENVOY_LINUX_RELEASE_DIR:-${TARGET_OUT_LINUX}/release}"
+ISTIO_ENVOY_LINUX_RELEASE_NAME="${ISTIO_ENVOY_LINUX_RELEASE_NAME:-${SIDECAR}-${ISTIO_ENVOY_VERSION}}"
+ISTIO_ENVOY_LINUX_RELEASE_PATH="${ISTIO_ENVOY_LINUX_RELEASE_PATH:-${ISTIO_ENVOY_LINUX_RELEASE_DIR}/${ISTIO_ENVOY_LINUX_RELEASE_NAME}}"
+
+# There is no longer an Istio built Envoy binary available for the Mac. Copy the Linux binary as the Mac binary was
+# very old and likely no one was really using it (at least temporarily).
+
+# Download Envoy debug and release binaries for Linux x86_64. They will be included in the
+# docker images created by Dockerfile.proxyv2.
+
+# Gets the download command supported by the system (currently either curl or wget)
+DOWNLOAD_COMMAND=""
+function set_download_command () {
+  # Try curl.
+  if command -v curl > /dev/null; then
+    if curl --version | grep Protocols  | grep https > /dev/null; then
+      DOWNLOAD_COMMAND="curl -fLSs --retry 5 --retry-delay 1 --retry-connrefused"
+      return
+    fi
+    echo curl does not support https, will try wget for downloading files.
+  else
+    echo curl is not installed, will try wget for downloading files.
+  fi
+
+  # Try wget.
+  if command -v wget > /dev/null; then
+    DOWNLOAD_COMMAND="wget -qO -"
+    return
+  fi
+  echo wget is not installed.
+
+  echo Error: curl is not installed or does not support https, wget is not installed. \
+       Cannot download envoy. Please install wget or add support of https to curl.
+  exit 1
 }
 
-echo "Installing go-junit-report..."
-command -v go-junit-report || install-junit-report
+# Downloads and extract an Envoy binary if the artifact doesn't already exist.
+# Params:
+#   $1: The URL of the Envoy tar.gz to be downloaded.
+#   $2: The full path of the output binary.
+#   $3: Non-versioned name to use
+function download_envoy_if_necessary () {
+  if [[ ! -f "$2" ]] ; then
+    # Enter the output directory.
+    mkdir -p "$(dirname "$2")"
+    pushd "$(dirname "$2")"
+
+    # Download and extract the binary to the output directory.
+    echo "Downloading ${SIDECAR}: $1 to $2"
+    time ${DOWNLOAD_COMMAND} --header "${AUTH_HEADER:-}" "$1" |\
+      tar --extract --gzip --strip-components=3 --to-stdout > "$2"
+    chmod +x "$2"
+
+    # Make a copy named just "envoy" in the same directory (overwrite if necessary).
+    echo "Copying $2 to $(dirname "$2")/${3}"
+    cp -f "$2" "$(dirname "$2")/${3}"
+    popd
+  fi
+}
+
+mkdir -p "${TARGET_OUT}"
+
+# Set the value of DOWNLOAD_COMMAND (either curl or wget)
+set_download_command
+
+if [[ -n "${DEBUG_IMAGE:-}" ]]; then
+  # Download and extract the Envoy linux debug binary.
+  download_envoy_if_necessary "${ISTIO_ENVOY_LINUX_DEBUG_URL}" "$ISTIO_ENVOY_LINUX_DEBUG_PATH" "${SIDECAR}"
+else
+  echo "Skipping envoy debug. Set DEBUG_IMAGE to download."
+fi
+
+# Download and extract the Envoy linux release binary.
+download_envoy_if_necessary "${ISTIO_ENVOY_LINUX_RELEASE_URL}" "$ISTIO_ENVOY_LINUX_RELEASE_PATH" "${SIDECAR}"
+ISTIO_ENVOY_NATIVE_PATH=${ISTIO_ENVOY_LINUX_RELEASE_PATH}
+
+# Copy native envoy binary to TARGET_OUT
+echo "Copying ${ISTIO_ENVOY_NATIVE_PATH} to ${TARGET_OUT}/${SIDECAR}"
+cp -f "${ISTIO_ENVOY_NATIVE_PATH}" "${TARGET_OUT}/${SIDECAR}"
+
+# Copy the envoy binary to TARGET_OUT_LINUX if the local OS is not Linux
+if [[ "$GOOS_LOCAL" != "linux" ]]; then
+   echo "Copying ${ISTIO_ENVOY_LINUX_RELEASE_PATH} to ${TARGET_OUT_LINUX}/${SIDECAR}"
+  cp -f "${ISTIO_ENVOY_LINUX_RELEASE_PATH}" "${TARGET_OUT_LINUX}/${SIDECAR}"
+fi

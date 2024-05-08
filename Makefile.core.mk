@@ -1,19 +1,64 @@
-# Get the source directory for this project
-ISTIOIO_GO := $(shell dirname $(realpath $(lastword $(MAKEFILE_LIST))))
-export ISTIOIO_GO
+## Copyright Istio Authors
+##
+## Licensed under the Apache License, Version 2.0 (the "License");
+## you may not use this file except in compliance with the License.
+## You may obtain a copy of the License at
+##
+##     http://www.apache.org/licenses/LICENSE-2.0
+##
+## Unless required by applicable law or agreed to in writing, software
+## distributed under the License is distributed on an "AS IS" BASIS,
+## WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+## See the License for the specific language governing permissions and
+## limitations under the License.
+
+# Our build tools, post jammy, breaks old versions of docker.
+# These old versions are surprisingly common, so build in a check here
+define warning
+Docker version is too old, please upgrade to a newer version.
+endef
+ifneq ($(findstring google,$(HOSTNAME)),)
+warning+=Googlers: go/installdocker\#the-version-of-docker-thats-installed-is-old-eg-1126
+endif
+# The old docker issue manifests as not being able to run *any* binary. So we can test
+# by trying to run a trivial program and ensuring it actually ran. If not, emit our warning.
+# Note: we cannot do anything like $(shell docker version) to check, since that would also fail.
+CAN_RUN := $(shell echo "can I run echo")
+ifeq ($(CAN_RUN),)
+$(error $(warning))
+endif
+
+#-----------------------------------------------------------------------------
+# Global Variables
+#-----------------------------------------------------------------------------
+ISTIO_GO := $(shell dirname $(realpath $(lastword $(MAKEFILE_LIST))))
+export ISTIO_GO
 SHELL := /bin/bash -o pipefail
+
+# Version can be defined:
+# (1) in a $VERSION shell variable, which takes precedence; or
+# (2) in the VERSION file, in which we will append "-dev" to it
+ifeq ($(VERSION),)
+VERSION_FROM_FILE := $(shell cat VERSION)
+ifeq ($(VERSION_FROM_FILE),)
+$(error VERSION not detected. Make sure it's stored in the VERSION file or defined in VERSION variable)
+endif
+VERSION := $(VERSION_FROM_FILE)-dev
+endif
+
+export VERSION
+
+# Base version of Istio image to use
+BASE_VERSION ?= 1.22-2024-04-26T19-01-49
+ISTIO_BASE_REGISTRY ?= gcr.io/istio-release
 
 export GO111MODULE ?= on
 export GOPROXY ?= https://proxy.golang.org
 export GOSUMDB ?= sum.golang.org
 
 # If GOPATH is not set by the env, set it to a sane value
-GOPATH ?= $(shell cd ${ISTIOIO_GO}/../../..; pwd)
+GOPATH ?= $(shell cd ${ISTIO_GO}/../../..; pwd)
 export GOPATH
-
-# Set the directory for Istio source.
-ISTIO_GO ?= $(GOPATH)/src/istio.io/istio
-export ISTIO_GO
 
 # If GOPATH is made up of several paths, use the first one for our targets in this Makefile
 GO_TOP := $(shell echo ${GOPATH} | cut -d ':' -f1)
@@ -21,225 +66,467 @@ export GO_TOP
 
 GO ?= go
 
-export GOARCH_LOCAL := $(TARGET_ARCH)
-export GOOS_LOCAL := $(TARGET_OS)
-export IN_BUILD_CONTAINER := $(IN_BUILD_CONTAINER)
+GOARCH_LOCAL := $(TARGET_ARCH)
+GOOS_LOCAL := $(TARGET_OS)
 
-# ISTIO_IMAGE_VERSION stores the prefix used by default for the Docker images for Istio.
-# For example, a value of 1.6-alpha will assume a default TAG value of 1.6-dev.<SHA>
-ISTIO_IMAGE_VERSION ?= 1.22-alpha
-export ISTIO_IMAGE_VERSION
+#-----------------------------------------------------------------------------
+# Output control
+#-----------------------------------------------------------------------------
+# Invoke make VERBOSE=1 to enable echoing of the command being executed
+export VERBOSE ?= 0
+# Place the variable Q in front of a command to control echoing of the command being executed.
+Q = $(if $(filter 1,$VERBOSE),,@)
+# Use the variable H to add a header (equivalent to =>) to informational output
+H = $(shell printf "\033[34;1m=>\033[0m")
 
-# Determine the SHA for the Istio dependency by parsing the go.mod file.
-ISTIO_SHA ?= $(shell < ${ISTIOIO_GO}/go.mod grep 'istio.io/istio v' | cut -d'-' -f3)
-export ISTIO_SHA
-
-# export ISTIO_LONG_SHA here. We will set the value in the `init` target
-export ISTIO_LONG_SHA
-
-# In the case that the images are build as part of a the normal public istio/istio pipeline,
-# we only need to export the pipeline HUB value.
-# If the images were built as part of the private pipeline (as for security releases),
-# we export the HUB and TAG for the images once they are published.
-HUB ?= gcr.io/istio-testing
-# export HUB := docker.io/istio
-# export TAG ?= 1.7.3
-
-ifeq ($(HUB),)
-  $(error "HUB cannot be empty")
+ifeq ($(origin DEBUG), undefined)
+  BUILDTYPE_DIR:=release
+else ifeq ($(DEBUG),0)
+  BUILDTYPE_DIR:=release
+else
+  BUILDTYPE_DIR:=debug
+  export GCFLAGS:=all=-N -l
+  $(info $(H) Build with debugger information)
 endif
 
+# Optional file including user-specific settings (HUB, TAG, etc)
+-include .istiorc.mk
+
 # Environment for tests, the directory containing istio and deps binaries.
-# Typically same as GOPATH/bin, so tests work seemlessly with IDEs.
+# Typically same as GOPATH/bin, so tests work seamlessly with IDEs.
 
 export ISTIO_BIN=$(GOBIN)
-# Using same package structure as pkg/
 
-export ISTIO_BIN=$(GOBIN)
-export ISTIO_OUT:=$(TARGET_OUT)
-export ISTIO_OUT_LINUX:=$(TARGET_OUT_LINUX)
+# If we are running in the Linux build container on non Linux hosts, we add the
+# linux binaries to the build dependencies, BUILD_DEPS, which can be added to other targets
+# that would need the Linux binaries (ex. tests).
+BUILD_DEPS:=
+ifeq ($(IN_BUILD_CONTAINER),1)
+  ifneq ($(GOOS_LOCAL),"linux")
+    BUILD_DEPS += build-linux
+  endif
+endif
 
-export ARTIFACTS ?= $(ISTIO_OUT)
+export ARTIFACTS ?= $(TARGET_OUT)
 export JUNIT_OUT ?= $(ARTIFACTS)/junit.xml
 export REPO_ROOT := $(shell git rev-parse --show-toplevel)
 
 # Make directories needed by the build system
-$(shell mkdir -p $(ISTIO_OUT))
+$(shell mkdir -p $(TARGET_OUT_LINUX))
+$(shell mkdir -p $(TARGET_OUT_LINUX)/logs)
 $(shell mkdir -p $(dir $(JUNIT_OUT)))
 
+# Need separate target for init:
+$(TARGET_OUT):
+	@mkdir -p $@
+
+# If the hub is not explicitly set, use default to istio.
+HUB ?=istio
+ifeq ($(HUB),)
+  $(error "HUB cannot be empty")
+endif
+
+# For dockerx builds, allow HUBS which is a space separated list of hubs. Default to HUB.
+HUBS ?= $(HUB)
+
+# If tag not explicitly set in users' .istiorc.mk or command line, default to the git sha.
+TAG ?= $(shell git rev-parse --verify HEAD)
+ifeq ($(TAG),)
+  $(error "TAG cannot be empty")
+endif
+
+PULL_POLICY ?= IfNotPresent
+ifeq ($(TAG),latest)
+  PULL_POLICY = Always
+endif
+ifeq ($(PULL_POLICY),)
+  $(error "PULL_POLICY cannot be empty")
+endif
+
+PROW_ARTIFACTS_BASE ?= https://gcsweb.istio.io/gcs/istio-prow
+
+include tools/proto/proto.mk
+
+.PHONY: default
+default: init build test
+
+.PHONY: init
+# Downloads envoy, based on the SHA defined in the base pilot Dockerfile
+init: $(TARGET_OUT)/istio_is_init init-ztunnel-rs
+	@mkdir -p ${TARGET_OUT}/logs
+	@mkdir -p ${TARGET_OUT}/release
+
+# I tried to make this dependent on what I thought was the appropriate
+# lock file, but it caused the rule for that file to get run (which
+# seems to be about obtaining a new version of the 3rd party libraries).
+$(TARGET_OUT)/istio_is_init: bin/init.sh istio.deps | $(TARGET_OUT)
+	@# Add a retry, as occasionally we see transient connection failures to GCS
+	@# Like `curl: (56) OpenSSL SSL_read: SSL_ERROR_SYSCALL, errno 104`
+	TARGET_OUT=$(TARGET_OUT) ISTIO_BIN=$(ISTIO_BIN) GOOS_LOCAL=$(GOOS_LOCAL) bin/retry.sh SSL_ERROR_SYSCALL bin/init.sh
+	touch $(TARGET_OUT)/istio_is_init
+
+.PHONY: init-ztunnel-rs
+init-ztunnel-rs:
+	TARGET_OUT=$(TARGET_OUT) bin/build_ztunnel.sh
+
+# Pull dependencies such as envoy
+depend: init | $(TARGET_OUT)
+
+DIRS_TO_CLEAN := $(TARGET_OUT)
+DIRS_TO_CLEAN += $(TARGET_OUT_LINUX)
+
+$(OUTPUT_DIRS):
+	@mkdir -p $@
+
+.PHONY: ${GEN_CERT}
+GEN_CERT := ${ISTIO_BIN}/generate_cert
+${GEN_CERT}:
+	GOOS=$(GOOS_LOCAL) && GOARCH=$(GOARCH_LOCAL) && common/scripts/gobuild.sh $@ ./security/tools/generate_cert
+
+#-----------------------------------------------------------------------------
+# Target: precommit
+#-----------------------------------------------------------------------------
+.PHONY: precommit format lint
+
+# Target run by the pre-commit script, to automate formatting and lint
+# If pre-commit script is not used, please run this manually.
+precommit: format lint
+
+format: fmt ## Auto formats all code. This should be run before sending a PR.
+
+fmt: format-go format-python tidy-go
+
+ifeq ($(DEBUG),1)
+# gobuild script uses custom linker flag to set the variables.
+RELEASE_LDFLAGS=''
+else
+RELEASE_LDFLAGS='-extldflags -static -s -w'
+endif
+
+# List of all binaries to build
+# We split the binaries into "agent" binaries and standard ones. This corresponds to build "agent".
+# This allows conditional compilation to avoid pulling in costly dependencies to the agent, such as XDS and k8s.
+AGENT_BINARIES:=./pilot/cmd/pilot-agent
+STANDARD_BINARIES:=./istioctl/cmd/istioctl \
+  ./pilot/cmd/pilot-discovery \
+  ./pkg/test/echo/cmd/client \
+  ./pkg/test/echo/cmd/server \
+  ./samples/extauthz/cmd/extauthz \
+  ./operator/cmd/operator
+
+# These are binaries that require Linux to build, and should
+# be skipped on other platforms. Notably this includes the current Linux-only Istio CNI plugin
+LINUX_AGENT_BINARIES:=./cni/cmd/istio-cni \
+  ./cni/cmd/install-cni \
+  $(AGENT_BINARIES)
+
+BINARIES:=$(STANDARD_BINARIES) $(AGENT_BINARIES) $(LINUX_AGENT_BINARIES)
+
+# List of binaries that have their size tested
+RELEASE_SIZE_TEST_BINARIES:=pilot-discovery pilot-agent istioctl envoy ztunnel client server
+
+# agent: enables agent-specific files. Usually this is used to trim dependencies where they would be hard to trim through standard refactoring
+# disable_pgv: disables protoc-gen-validation. This is not used buts adds many MB to Envoy protos
+# not set vtprotobuf: this adds some performance improvement, but at a binary cost increase that is not worth it for the agent
+AGENT_TAGS=agent,disable_pgv
+# disable_pgv: disables protoc-gen-validation. This is not used buts adds many MB to Envoy protos
+# vtprotobuf: enables optimized protobuf marshalling.
+STANDARD_TAGS=vtprotobuf,disable_pgv
+
+.PHONY: build
+build: depend ## Builds all go binaries.
+	GOOS=$(GOOS_LOCAL) GOARCH=$(GOARCH_LOCAL) LDFLAGS=$(RELEASE_LDFLAGS) common/scripts/gobuild.sh $(TARGET_OUT)/ -tags=$(STANDARD_TAGS) $(STANDARD_BINARIES)
+	GOOS=$(GOOS_LOCAL) GOARCH=$(GOARCH_LOCAL) LDFLAGS=$(RELEASE_LDFLAGS) common/scripts/gobuild.sh $(TARGET_OUT)/ -tags=$(AGENT_TAGS) $(AGENT_BINARIES)
+
+# The build-linux target is responsible for building binaries used within containers.
+# This target should be expanded upon as we add more Linux architectures: i.e. build-arm64.
+# Then a new build target can be created such as build-container-bin that builds these
+# various platform images.
+.PHONY: build-linux
+build-linux: depend
+	GOOS=linux GOARCH=$(GOARCH_LOCAL) LDFLAGS=$(RELEASE_LDFLAGS) common/scripts/gobuild.sh $(TARGET_OUT_LINUX)/ -tags=$(STANDARD_TAGS) $(STANDARD_BINARIES)
+	GOOS=linux GOARCH=$(GOARCH_LOCAL) LDFLAGS=$(RELEASE_LDFLAGS) common/scripts/gobuild.sh $(TARGET_OUT_LINUX)/ -tags=$(AGENT_TAGS) $(LINUX_AGENT_BINARIES)
+
+# Create targets for TARGET_OUT_LINUX/binary
+# There are two use cases here:
+# * Building all docker images (generally in CI). In this case we want to build everything at once, so they share work
+# * Building a single docker image (generally during dev). In this case we just want to build the single binary alone
+BUILD_ALL ?= true
+define build-linux
+.PHONY: $(TARGET_OUT_LINUX)/$(shell basename $(1))
+ifeq ($(BUILD_ALL),true)
+$(TARGET_OUT_LINUX)/$(shell basename $(1)): build-linux
+	@:
+else
+$(TARGET_OUT_LINUX)/$(shell basename $(1)): $(TARGET_OUT_LINUX)
+	GOOS=linux GOARCH=$(GOARCH_LOCAL) LDFLAGS=$(RELEASE_LDFLAGS) common/scripts/gobuild.sh $(TARGET_OUT_LINUX)/ -tags=$(2) $(1)
+endif
+endef
+
+$(foreach bin,$(STANDARD_BINARIES),$(eval $(call build-linux,$(bin),$(STANDARD_TAGS))))
+$(foreach bin,$(LINUX_AGENT_BINARIES),$(eval $(call build-linux,$(bin),$(AGENT_TAGS))))
+
+# Create helper targets for each binary, like "pilot-discovery"
+# As an optimization, these still build everything
+$(foreach bin,$(BINARIES),$(shell basename $(bin))): build
+ifneq ($(TARGET_OUT_LINUX),$(LOCAL_OUT))
+# if we are on linux already, then this rule is handled by build-linux above, which handles BUILD_ALL variable
+$(foreach bin,$(BINARIES),${LOCAL_OUT}/$(shell basename $(bin))): build
+endif
+
+MARKDOWN_LINT_ALLOWLIST=localhost:8080,storage.googleapis.com/istio-artifacts/pilot/,http://ratings.default.svc.cluster.local:9080/ratings
+
+lint-helm-global:
+	find manifests -name 'Chart.yaml' -print0 | ${XARGS} -L 1 dirname | xargs -r helm lint
+
+lint: lint-python lint-copyright-banner lint-scripts lint-go lint-dockerfiles lint-markdown lint-yaml lint-licenses lint-helm-global check-agent-deps ## Runs all linters.
+	@bin/check_samples.sh
+	@testlinter
+	@envvarlinter istioctl pilot security
+
+# Allow-list:
+# (k8s) Machinery, utils, klog
+# (proto) Istio API non-CRDs, MeshConfig and ProxyConfig
+# (proto) Envoy TLS proto for SDS
+# (proto) Envoy Wasm filters for wasm xDS proxy
+# (proto) xDS discovery service for xDS proxy
+.PHONY: check-agent-deps
+check-agent-deps:
+	@go list -f '{{ join .Deps "\n" }}' -tags=agent \
+			./pilot/cmd/pilot-agent/app \
+			./pkg/istio-agent/... | sort | uniq |\
+		grep -Pv '^k8s.io/(utils|klog|apimachinery)/' |\
+		grep -Pv 'envoy/type/|envoy/annotations|envoy/config/core/' |\
+		grep -Pv 'envoy/extensions/transport_sockets/tls/' |\
+		grep -Pv 'envoy/service/discovery/v3' |\
+		grep -Pv 'envoy/extensions/wasm/' |\
+		grep -Pv 'envoy/extensions/filters/(http|network)/wasm/' |\
+		grep -Pv 'istio\.io/api/(annotation|label|mcp|mesh|networking|security/v1alpha1|type)' |\
+		(! grep -P '^k8s.io|^sigs.k8s.io/gateway-api|cel|antlr|jwx/jwk|envoy/|istio.io/api')
+
+go-gen:
+	@mkdir -p /tmp/bin
+	@PATH="${PATH}":/tmp/bin go generate ./...
+
+refresh-goldens:
+	@REFRESH_GOLDEN=true go test ${GOBUILDFLAGS} ./operator/... \
+		./pkg/bootstrap/... \
+		./pkg/kube/inject/... \
+		./pilot/pkg/security/authz/builder/... \
+		./cni/pkg/plugin/...
+
+update-golden: refresh-goldens
+
+# Keep dummy target since some build pipelines depend on this
+gen-charts:
+	@echo "This target is no longer required and will be removed in the future"
+
+gen-addons:
+	manifests/addons/gen.sh
+
+gen: \
+	mod-download-go \
+	go-gen \
+	mirror-licenses \
+	format \
+	update-crds \
+	proto \
+	copy-templates \
+	gen-addons \
+	update-golden ## Update all generated code.
+
+gen-check: gen check-clean-repo
+
+CHARTS = gateway default ztunnel istio-operator base "gateways/istio-ingress" "gateways/istio-egress" "istio-control/istio-discovery" istiod-remote istio-cni
+copy-templates:
+	rm manifests/charts/istiod-remote/templates/*
+	rm manifests/charts/gateways/istio-egress/templates/*
+
+	# gateway charts
+	cp -r manifests/charts/gateways/istio-ingress/templates/* manifests/charts/gateways/istio-egress/templates
+	find ./manifests/charts/gateways/istio-egress/templates -type f -exec sed -i -e 's/ingress/egress/g' {} \;
+	find ./manifests/charts/gateways/istio-egress/templates -type f -exec sed -i -e 's/Ingress/Egress/g' {} \;
+
+	# external istiod remote cluster charts
+	cp manifests/charts/base/templates/services.yaml manifests/charts/istiod-remote/templates
+	cp manifests/charts/base/templates/endpoints.yaml manifests/charts/istiod-remote/templates
+	cp manifests/charts/base/templates/reader-serviceaccount.yaml manifests/charts/istiod-remote/templates
+	cp manifests/charts/istio-control/istio-discovery/templates/mutatingwebhook.yaml manifests/charts/istiod-remote/templates
+	cp manifests/charts/istio-control/istio-discovery/templates/reader-clusterrole.yaml manifests/charts/istiod-remote/templates
+	cp manifests/charts/istio-control/istio-discovery/templates/reader-clusterrolebinding.yaml manifests/charts/istiod-remote/templates
+
+	# external istiod config cluster charts
+	cp manifests/charts/istio-control/istio-discovery/files/injection-template.yaml manifests/charts/istiod-remote/files
+	cp manifests/charts/istio-control/istio-discovery/files/gateway-injection-template.yaml manifests/charts/istiod-remote/files
+	cp manifests/charts/istio-control/istio-discovery/templates/istiod-injector-configmap.yaml manifests/charts/istiod-remote/templates
+	cp manifests/charts/istio-control/istio-discovery/templates/configmap.yaml manifests/charts/istiod-remote/templates
+	cp manifests/charts/istio-control/istio-discovery/templates/_helpers.tpl manifests/charts/istiod-remote/templates
+	sed -e '1 i {{- if .Values.global.configCluster }}' -e '$$ a {{- end }}' manifests/charts/base/crds/crd-all.gen.yaml > manifests/charts/istiod-remote/templates/crd-all.gen.yaml
+	sed -e '1 i {{- if .Values.global.configCluster }}' -e '$$ a {{- end }}' manifests/charts/base/templates/default.yaml > manifests/charts/istiod-remote/templates/default.yaml
+	sed -e '1 i {{- if .Values.global.configCluster }}' -e '$$ a {{- end }}' manifests/charts/istio-control/istio-discovery/templates/validatingwebhookconfiguration.yaml > manifests/charts/istiod-remote/templates/validatingwebhookconfiguration.yaml
+	sed -e '1 i {{- if .Values.global.configCluster }}' -e '$$ a {{- end }}' manifests/charts/istio-control/istio-discovery/templates/serviceaccount.yaml > manifests/charts/istiod-remote/templates/serviceaccount.yaml
+	sed -e '1 i {{- if .Values.global.configCluster }}' -e '$$ a {{- end }}' manifests/charts/istio-control/istio-discovery/templates/role.yaml > manifests/charts/istiod-remote/templates/role.yaml
+	sed -e '1 i {{- if .Values.global.configCluster }}' -e '$$ a {{- end }}' manifests/charts/istio-control/istio-discovery/templates/rolebinding.yaml > manifests/charts/istiod-remote/templates/rolebinding.yaml
+	sed -e '1 i {{- if .Values.global.configCluster }}' -e '$$ a {{- end }}' manifests/charts/istio-control/istio-discovery/templates/clusterrole.yaml > manifests/charts/istiod-remote/templates/clusterrole.yaml
+	sed -e '1 i {{- if .Values.global.configCluster }}' -e '$$ a {{- end }}' manifests/charts/istio-control/istio-discovery/templates/clusterrolebinding.yaml > manifests/charts/istiod-remote/templates/clusterrolebinding.yaml
+
+	# copy istio-discovery values, but apply some local customizations
+	cp manifests/charts/istio-control/istio-discovery/values.yaml manifests/charts/istiod-remote/
+	yq -i '.defaults.telemetry.enabled=false | .defaults.global.externalIstiod=true | .defaults.global.omitSidecarInjectorConfigMap=true | .defaults.pilot.configMap=false' manifests/charts/istiod-remote/values.yaml
+	warning=$$(cat manifests/helm-profiles/warning-edit.txt | sed ':a;N;$$!ba;s/\n/\\n/g') ; \
+	for chart in $(CHARTS) ; do \
+		for profile in manifests/helm-profiles/*.yaml ; do \
+			sed "1s|^|$${warning}\n\n|" $$profile > manifests/charts/$$chart/files/profile-$$(basename $$profile) ; \
+		done; \
+		cp manifests/zzz_profile.yaml manifests/charts/$$chart/templates ; \
+	done
+
+#-----------------------------------------------------------------------------
+# Target: go build
+#-----------------------------------------------------------------------------
+
+# Non-static istioctl targets. These are typically a build artifact.
+${TARGET_OUT}/release/istioctl-linux-amd64:
+	GOOS=linux GOARCH=amd64 LDFLAGS=$(RELEASE_LDFLAGS) common/scripts/gobuild.sh $@ ./istioctl/cmd/istioctl
+${TARGET_OUT}/release/istioctl-linux-armv7:
+	GOOS=linux GOARCH=arm GOARM=7 LDFLAGS=$(RELEASE_LDFLAGS) common/scripts/gobuild.sh $@ ./istioctl/cmd/istioctl
+${TARGET_OUT}/release/istioctl-linux-arm64:
+	GOOS=linux GOARCH=arm64 LDFLAGS=$(RELEASE_LDFLAGS) common/scripts/gobuild.sh $@ ./istioctl/cmd/istioctl
+${TARGET_OUT}/release/istioctl-osx:
+	GOOS=darwin GOARCH=amd64 LDFLAGS=$(RELEASE_LDFLAGS) common/scripts/gobuild.sh $@ ./istioctl/cmd/istioctl
+${TARGET_OUT}/release/istioctl-osx-arm64:
+	GOOS=darwin GOARCH=arm64 LDFLAGS=$(RELEASE_LDFLAGS) common/scripts/gobuild.sh $@ ./istioctl/cmd/istioctl
+${TARGET_OUT}/release/istioctl-win.exe:
+	GOOS=windows LDFLAGS=$(RELEASE_LDFLAGS) common/scripts/gobuild.sh $@ ./istioctl/cmd/istioctl
+
+# generate the istioctl completion files
+${TARGET_OUT}/release/istioctl.bash: ${LOCAL_OUT}/istioctl
+	${LOCAL_OUT}/istioctl completion bash > ${TARGET_OUT}/release/istioctl.bash
+
+${TARGET_OUT}/release/_istioctl: ${LOCAL_OUT}/istioctl
+	${LOCAL_OUT}/istioctl completion zsh > ${TARGET_OUT}/release/_istioctl
+
+.PHONY: binaries-test
+binaries-test:
+	go test ${GOBUILDFLAGS} ./tests/binary/... -v --base-dir ${TARGET_OUT} --binaries="$(RELEASE_SIZE_TEST_BINARIES)"
+
+# istioctl-all makes all of the non-static istioctl executables for each supported OS
+.PHONY: istioctl-all
+istioctl-all: ${TARGET_OUT}/release/istioctl-linux-amd64 ${TARGET_OUT}/release/istioctl-linux-armv7 ${TARGET_OUT}/release/istioctl-linux-arm64 \
+	${TARGET_OUT}/release/istioctl-osx \
+	${TARGET_OUT}/release/istioctl-osx-arm64 \
+	${TARGET_OUT}/release/istioctl-win.exe
+
+.PHONY: istioctl.completion
+istioctl.completion: ${TARGET_OUT}/release/istioctl.bash ${TARGET_OUT}/release/_istioctl
+
+# istioctl-install builds then installs istioctl into $GOPATH/BIN
+# Used for debugging istioctl during dev work
+.PHONY: istioctl-install-container
+istioctl-install-container: istioctl
+
+#-----------------------------------------------------------------------------
+# Target: test
+#-----------------------------------------------------------------------------
+
+.PHONY: test
+
+# This target sets JUNIT_REPORT to the location of the  go-junit-report binary.
+# This binary is provided in the build container. If it is not found, the build
+# container is not being used, so ask the user to install go-junit-report.
 JUNIT_REPORT := $(shell which go-junit-report 2> /dev/null || echo "${ISTIO_BIN}/go-junit-report")
 
-ISTIO_SERVE_DOMAIN ?= localhost
-export ISTIO_SERVE_DOMAIN
+${ISTIO_BIN}/go-junit-report:
+	@echo "go-junit-report was not found in the build environment."
+	@echo "Please install go-junit-report (ex. go install github.com/jstemmer/go-junit-report@latest)"
+	@exit 1
 
-ifeq ($(CONTEXT),production)
-baseurl := "$(URL)"
-endif
+# This is just an alias for racetest now
+test: racetest ## Runs all unit tests
 
-# Which branch of the Istio source code do we fetch stuff from
-export SOURCE_BRANCH_NAME ?= release-1.22
+# For now, keep a minimal subset. This can be expanded in the future.
+BENCH_TARGETS ?= ./pilot/...
 
-site:
-	@scripts/gen_site.sh
+PKG ?= ./...
+.PHONY: racetest
+racetest: $(JUNIT_REPORT)
+	go test ${GOBUILDFLAGS} ${T} -race $(PKG) 2>&1 | tee >($(JUNIT_REPORT) > $(JUNIT_OUT))
 
-snips:
-	@scripts/gen_snips.sh
+.PHONY: benchtest
+benchtest: $(JUNIT_REPORT) ## Runs all benchmarks
+	prow/benchtest.sh run $(BENCH_TARGETS)
+	prow/benchtest.sh compare
 
-# Force locale, since macOS and Linux use different locales. Otherwise updates from macOS users will
-# fail make gen-check with an incorrect (for the pipeline) .spelling.
-format-spelling:
-	@echo "Sorting the .spelling file..."
-	@LC_ALL=C sort .spelling --ignore-case -o .spelling
-	@echo ".spelling file sorted."
+report-benchtest:
+	prow/benchtest.sh report
 
-gen: tidy-go format-go update-gateway-version snips format-spelling
+#-----------------------------------------------------------------------------
+# Target: clean
+#-----------------------------------------------------------------------------
+.PHONY: clean
 
-gen-check: gen check-clean-repo check-localization
+clean: ## Cleans all the intermediate files and folders previously generated.
+	rm -rf $(DIRS_TO_CLEAN)
 
-check-localization:
-	@scripts/check_localization.sh
+#-----------------------------------------------------------------------------
+# Target: docker
+#-----------------------------------------------------------------------------
+.PHONY: push
 
-build: site
-	@scripts/build_site.sh ""
+# for now docker is limited to Linux compiles - why ?
+include tools/istio-docker.mk
 
-build_nominify: site
-	@scripts/build_site.sh "" -no_minify
+push: docker.push ## Build and push docker images to registry defined by $HUB and $TAG
 
-build_with_archive: site
-	@scripts/gen_site.sh
-	@scripts/build_site.sh "/latest"
-	@scripts/include_archive_site.sh
+#-----------------------------------------------------------------------------
+# Target: environment and tools
+#-----------------------------------------------------------------------------
+.PHONY: show.env show.goenv
 
-opt:
-	@scripts/opt_site.sh
+show.env: ; $(info $(H) environment variables...)
+	$(Q) printenv
 
-clean:
-	@rm -fr resources .htmlproofer tmp generated public out samples install go tests/integration/ manifests
+show.goenv: ; $(info $(H) go environment...)
+	$(Q) $(GO) version
+	$(Q) $(GO) env
 
-lint: clean_public build_nominify lint-copyright-banner lint-python lint-yaml lint-dockerfiles lint-scripts lint-sass lint-typescript lint-go
-	@scripts/lint_site.sh
+# show makefile variables. Usage: make show.<variable-name>
+show.%: ; $(info $* $(H) $($*))
+	$(Q) true
 
-lint-en: clean_public build_nominify lint-copyright-banner lint-python lint-yaml lint-dockerfiles lint-scripts lint-sass lint-typescript lint-go
-	@scripts/lint_site.sh en
+#-----------------------------------------------------------------------------
+# Target: custom resource definitions
+#-----------------------------------------------------------------------------
 
-lint-fast: clean_public build_nominify lint-copyright-banner lint-python lint-yaml lint-dockerfiles lint-scripts lint-sass lint-typescript lint-go
-	@SKIP_LINK_CHECK=true scripts/lint_site.sh en
+update-crds:
+	bin/update_crds.sh
 
-lint-md: clean_public build_nominify
-	@SKIP_LINK_CHECK=true scripts/lint_site.sh en
+#-----------------------------------------------------------------------------
+# Target: artifacts and distribution
+#-----------------------------------------------------------------------------
+# deb, rpm, etc packages
+include tools/packaging/packaging.mk
 
-serve: site
-	@hugo serve --baseURL "http://${ISTIO_SERVE_DOMAIN}:1313/latest/" --bind 0.0.0.0 --watch --disableFastRender
+#-----------------------------------------------------------------------------
+# Target: integration tests
+#-----------------------------------------------------------------------------
+include tests/integration/tests.mk
 
-archive-version:
-	@scripts/archive_version.sh
+#-----------------------------------------------------------------------------
+# Target: bookinfo sample
+#-----------------------------------------------------------------------------
 
-# used by netlify.com when building the site. The tool versions should correspond
-# to what is included in the tools repo in docker/build-tools/Dockerfile.
-netlify_install:
-	@npm init -y
-	@npm install --omit=dev --global \
-	    sass@v1.52.1 \
-	    typescript@v4.7.2 \
-	    svgstore-cli@v1.3.2 \
-		@babel/core@v7.18.2 \
-		@babel/cli@v7.17.10 \
-		@babel/preset-env@v7.18.2
-	@npm install --omit=dev --save-dev \
-		babel-preset-minify@v0.5.2
-	@npm install --save \
-		core-js@3.31.1
+export BOOKINFO_VERSION ?= 1.18.0
 
-netlify: netlify_install
-	@scripts/gen_site.sh
-	@scripts/build_site.sh "/latest"
-	@scripts/include_archive_site.sh
+.PHONY: bookinfo.build bookinfo.push
 
-# ISTIO_API_GIT_SOURCE allows to override the default Istio API repository, https://github.com/istio/api@$(SOURCE_BRANCH_NAME)
-# with, for example, a mapped local directory: file:///work/istio/api@branch-name when running `update_ref_docs`.
-#
-# The format for ISTIO_API_GIT_SOURCE value is {GIT_URL}@{TARGET_BRANCH_NAME}.
-#
-# Note that when running with BUILD_WITH_CONTAINER=1, we can map the local directory by setting
-# the ADDITIONAL_CONTAINER_OPTIONS environment variable as shown in the below example:
-#
-# $ BUILD_WITH_CONTAINER=1 \
-#   ISTIO_API_GIT_SOURCE="file:///work/istio/api@branchname" \
-#   ADDITIONAL_CONTAINER_OPTIONS="-v /path/to/local/istio/api:/work/istio/api" \
-#   	make update_ref_docs
-export ISTIO_API_GIT_SOURCE ?=
-update_ref_docs:
-	@scripts/grab_reference_docs.sh $(SOURCE_BRANCH_NAME) $(ISTIO_API_GIT_SOURCE)
+bookinfo.build:
+	@prow/buildx-create
+	@BOOKINFO_TAG=${BOOKINFO_VERSION} BOOKINFO_HUB=${HUB} samples/bookinfo/src/build-services.sh
 
-update_test_reference: get_istio_sha gen
-
-get_istio_sha:
-	@go get istio.io/istio@$(SOURCE_BRANCH_NAME) && go mod tidy
-
-update_all: update_ref_docs update_test_reference
-
-foo2:
-	hugo version
-
-# Release related targets
-export ISTIOIO_GIT_SOURCE := https://github.com/istio/istio.io.git
-export MASTER := master
-
-prepare-%:
-	@scripts/prepare_release.sh $@
-
-release-%-dry-run:
-	@DRY_RUN=1 scripts/create_version.sh $(subst -dry-run,,$@)
-
-release-%:
-	@scripts/create_version.sh $@
-
-build-old-archive-%:
-	@scripts/build_old_archive.sh $@
-
-# The init recipe was split into two recipes to solve an issue seen in prow
-# where paralyzation is happening and some tasks in a recipe were occuring out
-# of order. The desired behavior is for `preinit` to do the clone and set up the
-# istio/istio directory. Then the eval task in `init` will have the directory in
-# which to run the `git command.
-.PHONY: preinit init
-preinit:
-	@echo "ISTIO_SHA = ${ISTIO_SHA}"
-	@echo "HUB = ${HUB}"
-	@bin/init.sh
-
-init: preinit
-	$(eval ISTIO_LONG_SHA := $(shell cd ${ISTIO_GO} && git rev-parse ${ISTIO_SHA}))
-	@echo "ISTIO_LONG_SHA=${ISTIO_LONG_SHA}"
-ifndef TAG
-	$(eval TAG := ${ISTIO_IMAGE_VERSION}.${ISTIO_LONG_SHA})
-endif
-# If a variant is defined, update the tag accordingly
-ifdef VARIANT
-	$(eval TAG=${TAG}-${VARIANT})
-endif
-	@export TAG
-	@echo "TAG=${TAG}"
-	$(eval BASE_VERSION := $(shell cd ${ISTIO_GO} && grep BASE_VERSION Makefile.core.mk | awk '{ print $$3}'))
-	@echo "BASE_VERSION=${BASE_VERSION}"
-	@export BASE_VERSION
-
-# doc test framework
-include tests/tests.mk
-
-# remains of old framework to pass istio-testing
-test.kube.presubmit: doc.test
-
-# remains of old framework to pass istio-testing
-test.kube.postsubmit: test.kube.presubmit
-
-test_status:
-	@scripts/test_status.sh
-
-update-gateway-version: tidy-go
-	$(eval GATEWAY_VERSION := ${shell scripts/get_gateway_api_version.sh})
-	@${shell sed -Ei 's|k8s_gateway_api_version: ".*"|k8s_gateway_api_version: "${GATEWAY_VERSION}"|' 'data/args.yml'}
+bookinfo.push: MULTI_ARCH=true
+bookinfo.push:
+	@prow/buildx-create
+	@BOOKINFO_TAG=${BOOKINFO_VERSION} BOOKINFO_HUB=${HUB} samples/bookinfo/src/build-services.sh --push
 
 include common/Makefile.common.mk
-
-.PHONY: site gen build build_nominify opt clean_public clean lint serve netlify_install netlify netlify_archive archive update_ref_docs update_operator_yamls update_all update-gateway-version

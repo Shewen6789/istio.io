@@ -1,22 +1,22 @@
-## Description
+**Please provide a description of this PR:**
 
-<!-- Please replace this line with a description of the PR. -->
 
-## Reviewers
 
-<!-- To help us figure out who should review this PR, please 
-     put an X in all the areas that this PR affects. -->
+**To help us figure out who should review this PR, please put an X in all the areas that this PR affects.**
 
 - [ ] Ambient
+- [ ] Configuration Infrastructure
 - [ ] Docs
+- [ ] Dual Stack
 - [ ] Installation
 - [ ] Networking
 - [ ] Performance and Scalability
-- [ ] Extensions and Telemetry
+- [ ] Policies and Telemetry
 - [ ] Security
 - [ ] Test and Release
 - [ ] User Experience
 - [ ] Developer Infrastructure
-- [ ] Localization/Translation
 
-<!-- If this is a localization PR, please replace this line with the URL of the original English document. -->
+**Please check any characteristics that apply to this pull request.**
+
+- [ ] Does not have any [user-facing](https://github.com/istio/istio/tree/master/releasenotes#when-to-add-release-notes) changes. This may include CLI changes, API changes, behavior changes, performance improvements, etc.
